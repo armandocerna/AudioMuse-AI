@@ -211,7 +211,7 @@ def _find_onnx_name(candidate_name, names):
 # MIGraphX JIT-compiles a new program for each unique input shape (~48s for the
 # embedding model). Padding all batch inputs to a fixed size means MIGraphX only
 # compiles once per model, then every subsequent inference reuses the cached program.
-_MIGRAPHX_PAD_BATCH = int(os.environ.get('MIGRAPHX_PAD_BATCH', '64'))
+_MIGRAPHX_PAD_BATCH = int(os.environ.get('MIGRAPHX_PAD_BATCH', '256'))
 _use_migraphx_padding = 'MIGraphXExecutionProvider' in ort.get_available_providers()
 
 def run_inference(onnx_session, feed_dict, output_tensor_name=None):
