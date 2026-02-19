@@ -123,6 +123,57 @@ CLASS_INDEX_MAP = {
 }
 
 
+# --- Global ONNX Session Pool ---
+# MIGraphX JIT-compiles models on first load (~30s). Creating sessions per-task
+# means every concurrent album task pays this cost. A global pool compiles once
+# at worker startup and all tasks reuse the same sessions.
+import threading
+_global_onnx_sessions = None
+_global_onnx_lock = threading.Lock()
+
+def get_global_onnx_sessions(model_paths):
+    """Get or create the global ONNX session pool (thread-safe, lazy init)."""
+    global _global_onnx_sessions
+    if _global_onnx_sessions is not None:
+        return _global_onnx_sessions
+
+    with _global_onnx_lock:
+        if _global_onnx_sessions is not None:
+            return _global_onnx_sessions
+
+        logger.info("Initializing global ONNX session pool (one-time MIGraphX compilation)...")
+        sessions = {}
+        available_providers = ort.get_available_providers()
+
+        if 'CUDAExecutionProvider' in available_providers:
+            gpu_device_id = 0
+            cuda_options = {
+                'device_id': gpu_device_id,
+                'arena_extend_strategy': 'kSameAsRequested',
+                'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                'do_copy_in_default_stream': True,
+            }
+            provider_options = [('CUDAExecutionProvider', cuda_options), ('CPUExecutionProvider', {})]
+        else:
+            provider_options = [('CPUExecutionProvider', {})]
+
+        for model_name, model_path in model_paths.items():
+            try:
+                sessions[model_name] = ort.InferenceSession(
+                    model_path,
+                    providers=[p[0] for p in provider_options],
+                    provider_options=[p[1] for p in provider_options]
+                )
+            except Exception:
+                sessions[model_name] = ort.InferenceSession(
+                    model_path,
+                    providers=['CPUExecutionProvider']
+                )
+        logger.info(f"✓ Global ONNX session pool ready: {len(sessions)} models loaded")
+        _global_onnx_sessions = sessions
+        return _global_onnx_sessions
+
+
 # --- Utility Functions ---
 def clean_temp(temp_dir):
     os.makedirs(temp_dir, exist_ok=True)
@@ -679,16 +730,12 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
             'sad': SAD_MODEL_PATH
         }
         
-        # Essentia models will be lazy-loaded on first song that needs MusiCNN analysis
-        onnx_sessions = None
-        
-        # Initialize SessionRecycler to prevent cumulative memory leaks
-        # Interval depends on PER_SONG_MODEL_RELOAD setting:
-        # - true: Reload every 1 song (aggressive, prevents memory leaks)
-        # - false: Reload every 20 songs (original behavior, faster but may accumulate memory)
-        recycle_interval = 1 if PER_SONG_MODEL_RELOAD else 20
-        session_recycler = SessionRecycler(recycle_interval=recycle_interval)
-        logger.info(f"MusiCNN session recycling: every {recycle_interval} song(s) (PER_SONG_MODEL_RELOAD={PER_SONG_MODEL_RELOAD})")
+        # Use global session pool to avoid per-task MIGraphX recompilation
+        onnx_sessions = get_global_onnx_sessions(model_paths)
+
+        # Session recycling disabled when using global pool (sessions persist for worker lifetime)
+        session_recycler = SessionRecycler(recycle_interval=999999)
+        logger.info(f"Using global ONNX session pool ({len(onnx_sessions)} models, no recycling)")
 
         def log_and_update_album_task(message, progress, **kwargs):
             nonlocal current_progress_val, current_task_logs
