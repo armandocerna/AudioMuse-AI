@@ -732,6 +732,7 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
         
         # Use global session pool to avoid per-task MIGraphX recompilation
         onnx_sessions = get_global_onnx_sessions(model_paths)
+        using_global_pool = True
 
         # Session recycling disabled when using global pool (sessions persist for worker lifetime)
         session_recycler = SessionRecycler(recycle_interval=999999)
@@ -894,7 +895,8 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                                 onnx_sessions = None
                         
                         # Check if sessions should be recycled to prevent cumulative memory leaks
-                        if onnx_sessions and session_recycler.should_recycle():
+                        # Never recycle global pool sessions
+                        if onnx_sessions and not using_global_pool and session_recycler.should_recycle():
                             logger.info(f"Recycling ONNX sessions after {session_recycler.get_use_count()} tracks")
                             
                             # Cleanup old sessions
@@ -1016,7 +1018,8 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                         os.remove(path)
             
             # Cleanup all models after album analysis to free memory
-            if onnx_sessions:
+            # Skip cleanup when using global pool — sessions persist for worker lifetime
+            if onnx_sessions and not using_global_pool:
                 logger.info(f"Cleaning up {len(onnx_sessions)} Essentia model sessions")
                 for model_name, session in onnx_sessions.items():
                     cleanup_onnx_session(session, model_name)
@@ -1036,8 +1039,9 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                 unload_mulan_model()
             
             # Final comprehensive cleanup after album completion
+            # When using global pool, don't reset ONNX pool
             logger.info("Performing final comprehensive cleanup after album analysis")
-            comprehensive_memory_cleanup(force_cuda=True, reset_onnx_pool=True)
+            comprehensive_memory_cleanup(force_cuda=True, reset_onnx_pool=not using_global_pool)
 
             summary = {"tracks_analyzed": tracks_analyzed_count, "tracks_skipped": tracks_skipped_count, "total_tracks_in_album": total_tracks_in_album}
             log_and_update_album_task(f"Album '{album_name}' analysis complete.", 100, task_state=TASK_STATUS_SUCCESS, final_summary_details=summary)
@@ -1053,7 +1057,8 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
             raise
         finally:
             # ✅ Always cleanup, even on error or early return
-            if onnx_sessions:
+            # Skip cleanup when using global pool — sessions persist for worker lifetime
+            if onnx_sessions and not using_global_pool:
                 logger.info(f"Cleaning up {len(onnx_sessions)} Essentia model sessions (finally block)")
                 for model_name, session in onnx_sessions.items():
                     try:
@@ -1065,7 +1070,7 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
             
             # Cleanup CUDA memory
             try:
-                comprehensive_memory_cleanup(force_cuda=True, reset_onnx_pool=True)
+                comprehensive_memory_cleanup(force_cuda=True, reset_onnx_pool=not using_global_pool)
                 logger.debug("Final comprehensive cleanup completed (finally block)")
             except Exception as e:
                 logger.warning(f"Error during final comprehensive cleanup: {e}")
