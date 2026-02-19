@@ -208,6 +208,12 @@ def _find_onnx_name(candidate_name, names):
     # fallback: return first name
     return names[0] if names else None
 
+# MIGraphX JIT-compiles a new program for each unique input shape (~48s for the
+# embedding model). Padding all batch inputs to a fixed size means MIGraphX only
+# compiles once per model, then every subsequent inference reuses the cached program.
+_MIGRAPHX_PAD_BATCH = int(os.environ.get('MIGRAPHX_PAD_BATCH', '256'))
+_use_migraphx_padding = 'MIGraphXExecutionProvider' in ort.get_available_providers()
+
 def run_inference(onnx_session, feed_dict, output_tensor_name=None):
     """Run inference on an ONNX Runtime session.
 
@@ -240,10 +246,30 @@ def run_inference(onnx_session, feed_dict, output_tensor_name=None):
         logger.error("No ONNX output name available to run inference.")
         return None
 
+    # MIGraphX padding: pad batch dim to fixed size to avoid per-shape recompilation
+    real_batch = None
+    if _use_migraphx_padding and _MIGRAPHX_PAD_BATCH > 0:
+        for name in list(mapped.keys()):
+            arr = mapped[name]
+            if isinstance(arr, np.ndarray) and arr.ndim >= 2:
+                batch = arr.shape[0]
+                if batch < _MIGRAPHX_PAD_BATCH:
+                    real_batch = batch
+                    pad_width = [(0, _MIGRAPHX_PAD_BATCH - batch)] + [(0, 0)] * (arr.ndim - 1)
+                    mapped[name] = np.pad(arr, pad_width, mode='constant', constant_values=0)
+                elif batch > _MIGRAPHX_PAD_BATCH:
+                    # Batch exceeds pad size — fall through without padding
+                    real_batch = None
+
     # Run and return numpy array
     result = onnx_session.run([onnx_output_name], mapped)
-    # onnxruntime returns a list of outputs in the same order
-    return result[0] if isinstance(result, list) and len(result) > 0 else result
+    out = result[0] if isinstance(result, list) and len(result) > 0 else result
+
+    # Slice off padding if we added any
+    if real_batch is not None and isinstance(out, np.ndarray) and out.shape[0] == _MIGRAPHX_PAD_BATCH:
+        out = out[:real_batch]
+
+    return out
 
 def sigmoid(x):
     """Numerically stable sigmoid function."""
